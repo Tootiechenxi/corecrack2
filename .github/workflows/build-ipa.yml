@@ -1,0 +1,122 @@
+name: Build CoreCrack IPA
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 诊断工具链（关键：定位 iPhoneOS SDK）
+        run: |
+          set -x
+          echo "=== xcode-select 位置 ==="
+          xcode-select -p || echo "(无 xcode-select)"
+          echo "=== 所有 SDK 列表 ==="
+          xcrun --sdk iphoneos --show-sdk-path 2>&1 || echo "!!! iphoneos SDK 不可用"
+          ls /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/ 2>&1 || echo "(无 Xcode iPhoneOS SDK 目录)"
+          echo "=== clang 版本 ==="
+          clang --version 2>&1 | head -5 || echo "(无 clang)"
+          echo "=== 可用的 SDK ==="
+          xcodebuild -showsdks 2>&1 || echo "(xcodebuild 不可用)"
+
+      - name: 编译 CoreCrack（arm64）
+        run: |
+          set -x
+          # 尝试多种方式定位 iPhoneOS SDK
+          SDK=""
+          # 方式1：xcrun
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo "")
+          # 方式2：直接找 Xcode 自带 SDK
+          if [ -z "$SDK" ]; then
+            SDK=$(ls -d /Applications/Xcode*.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS*.sdk 2>/dev/null | head -1 || echo "")
+          fi
+          # 方式3：printenv 里可能有的
+          if [ -z "$SDK" ] && [ -n "$IPHONEOS_DEPLOYMENT_TARGET" ]; then
+            SDK=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo "")
+          fi
+          echo "使用的 SDK: '$SDK'"
+          if [ -z "$SDK" ]; then
+            echo "!!! 找不到 iPhoneOS SDK，将尝试安装完整 Xcode"
+            # macOS runner 若只有 CLT，这里给出明确指引
+            exit 1
+          fi
+
+          # 编译 .m -> .o（-c 阶段不需要 -framework，避免 warning）
+          xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
+                -miphoneos-version-min=14.0 \
+                -fobjc-arc \
+                -c CoreCrack.m -o CoreCrackCore.o
+
+          xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
+                -miphoneos-version-min=14.0 \
+                -fobjc-arc \
+                -c HostsCrack.m -o HostsCrack.o
+
+          xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
+                -miphoneos-version-min=14.0 \
+                -fobjc-arc \
+                -c DomainSwap.m -o DomainSwap.o
+
+          xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
+                -miphoneos-version-min=14.0 \
+                -fobjc-arc \
+                -c main.m -o main.o
+
+          xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
+                -miphoneos-version-min=14.0 \
+                -framework Foundation -framework UIKit \
+                main.o CoreCrackCore.o HostsCrack.o DomainSwap.o \
+                -o CoreCrack
+
+          echo "=== 编译结果 ==="
+          file CoreCrack
+          ls -la CoreCrack
+
+      - name: 打包 .app
+        run: |
+          set -x
+          mkdir -p Payload/CoreCrack.app
+          cp CoreCrack Payload/CoreCrack.app/
+          cp Info.plist Payload/CoreCrack.app/
+          cp entitlements.plist Payload/CoreCrack.app/ 2>/dev/null || echo "无 entitlements.plist"
+          ls -la Payload/CoreCrack.app/
+
+      - name: 用 ldid 签名并注入 entitlements
+        run: |
+          set -x
+          # 尝试装 ldid，失败也不致命（TrollStore 装时会自己签）
+          brew install ldid 2>/dev/null || true
+          if command -v ldid >/dev/null 2>&1; then
+            if [ -f entitlements.plist ]; then
+              ldid -Sentitlements.plist Payload/CoreCrack.app/CoreCrack && echo "已用 entitlements 签名"
+            else
+              ldid -S Payload/CoreCrack.app/CoreCrack && echo "已普通签名"
+            fi
+          else
+            echo "无 ldid，跳过（TrollStore 安装时会自动处理签名与 entitlement）"
+          fi
+
+      - name: 打包 ipa
+        run: |
+          set -x
+          zip -qr CoreCrack.ipa Payload/
+          echo "=== ipa 产物 ==="
+          ls -la CoreCrack.ipa
+
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoreCrack-ipa
+          path: CoreCrack.ipa
+
+      - name: 上传三连 hook 脚本
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoreCrack-frida-js
+          path: CoreCrack.js
